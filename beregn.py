@@ -2,7 +2,7 @@
 beregn.py
 =========
 Generel beregning af enkelt-partikel transmission
-for vilkaarlige molekyler med B-felt sweep.
+for vilkaarlige molekyler.
 
 Kan sweepe over:
   - B-felt (Bx, By, Bz)
@@ -26,6 +26,8 @@ from slowquant.unitary_coupled_cluster.ucc_wavefunction import WaveFunctionUCC
 from slowquant.molecularintegrals.integralfunctions import (
     one_electron_integral_transform
 )
+
+Ha_to_eV = 27.2114
 
 
 # =======================================================================
@@ -70,7 +72,7 @@ MOLECULES = {
 
 
 # =======================================================================
-# Beregn transmission for ét B-punkt
+# Beregn transmission for ét sæt parametre
 # =======================================================================
 
 def beregn_et_punkt(
