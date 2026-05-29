@@ -4,11 +4,14 @@ beregn.py
 Generel beregning af enkelt-partikel transmission
 for vilkaarlige molekyler med B-felt sweep.
 
+Kan sweepe over:
+  - B-felt (Bx, By, Bz)
+  - Koblingsstyrke V
+
 Brug:
-    python beregn.py                     <- H2, ingen B-felt
-    python beregn.py --mol LiH           <- skift molekyle
-    python beregn.py --mol H2 --Bmax 2.0 <- med B-felt sweep
-    python beregn.py --mol H2O --V 0.8 --beta -1.5
+    python beregn.py --mol H2
+    python beregn.py --mol H2 --V_vals 2.0 2.1 2.2 2.3
+    python beregn.py --mol H2 --Bmax 2.0
 """
 
 import numpy as np
@@ -63,18 +66,6 @@ MOLECULES = {
         "beskr"    : "Vand, STO-3G",
     },
 
-    "NH3": {
-        "geometry" : (
-            "N  0.000  0.000  0.116; "
-            "H  0.000  0.939 -0.271; "
-            "H  0.813 -0.470 -0.271; "
-            "H -0.813 -0.470 -0.271"
-        ),
-        "basis_set": "sto-3g",
-        "cas"      : (2, 4),
-        "beskr"    : "Ammoniak, STO-3G",
-    },
-
 }
 
 
@@ -83,13 +74,82 @@ MOLECULES = {
 # =======================================================================
 
 def beregn_et_punkt(
-    geometry, basis_set, cas,
-    B_vec, V, site_energy, beta, p_vals
+    SMobj,
+    V, site_energy, beta,
+    p_vals, num_leads=2
 ):
     """
-    Beregner T(p) for ét B-felt punkt.
-    Returnerer dict med resultater.
+    Beregner T(E_kin) for ét (SMobj, V) punkt.
+    Energi returneres i eV.
     """
+    SMobj.V = V
+
+    T_vals = []
+    E_vals = []   # kinetisk energi i eV
+
+    for p in p_vals:
+        try:
+            S, _ = SMobj.S_matrix(
+                num_leads=num_leads,
+                site_energy=site_energy,
+                beta=beta,
+                p_in=p
+            )
+            # Kinetisk energi i lead: E_kin = alpha + 2*beta*cos(p)
+            # Her: alpha = site_energy
+            E_kin = (site_energy + 2*beta*np.cos(p)) * Ha_to_eV
+            T_vals.append(float(abs(S[0, 1])**2))
+            E_vals.append(float(E_kin))
+        except Exception:
+            T_vals.append(float("nan"))
+            E_vals.append(float("nan"))
+
+    return np.array(E_vals), np.array(T_vals)
+
+
+# =======================================================================
+# Byg SMobj én gang og sweep over V
+# =======================================================================
+
+def beregn_V_sweep(
+    mol_navn,
+    V_vals,
+    B_vec        = np.array([0., 0., 0.]),
+    site_energy  = 1.0,
+    beta         = -1.0,
+    N_p          = 500,
+    num_leads    = 2,
+    gem_fil      = None,
+):
+    """
+    Beregner transmission for en liste af V-værdier
+    ved fast B-felt. Bygger kun WF én gang.
+    """
+    if mol_navn not in MOLECULES:
+        raise ValueError(f"'{mol_navn}' ikke fundet. "
+                         f"Valg: {list(MOLECULES.keys())}")
+
+    mol       = MOLECULES[mol_navn]
+    geometry  = mol["geometry"]
+    basis_set = mol["basis_set"]
+    cas       = mol["cas"]
+
+    if gem_fil is None:
+        gem_fil = f"{mol_navn}_V_sweep.pkl"
+
+    p_vals = np.linspace(0.01, np.pi - 0.01, N_p)
+
+    print(f"\n{'='*60}")
+    print(f"Molekyle : {mol_navn}  ({mol['beskr']})")
+    print(f"Basis    : {basis_set}, CAS: {cas}")
+    print(f"B        : {B_vec}")
+    print(f"V-sweep  : {V_vals}")
+    print(f"beta={beta}, site_energy={site_energy}")
+    print(f"Gem til  : {gem_fil}")
+    print(f"{'='*60}\n")
+
+    # Byg WF og SMobj én gang
+    print("Bygger bølgefunktion...")
     mo, h_kin, h_nuc_ao, g_eri, \
         t_LB, t_BB, h_nuc, pyscf_mol = \
         integral_provider(geometry, basis_set, B_vec)
@@ -104,58 +164,64 @@ def beregn_et_punkt(
         mo, h_kin + h_nuc_ao + t_BB + t_LB
     )
 
-    SMobj   = S_matrix_1e(wf=WF, h_nuc=h_nuc)
-    SMobj.V = V
+    SMobj = S_matrix_1e(wf=WF, h_nuc=h_nuc)
 
     E0   = SMobj.eigval_N[0]
-    ENp1 = SMobj.eigval_Np1
+    ENp1 = SMobj.eigval_Np1[0]
+    E_res_eV = (ENp1 - E0 - site_energy) * Ha_to_eV
 
-    print(f"  E_0^(eta)   = {E0:.6f} Ha")
-    print(f"  E_0^(eta+1) = {ENp1[0]:.6f} Ha")
-    print(f"  1e resonans = {ENp1[0]-E0:.6f} Ha")
+    print(f"E_0^(eta)   = {E0:.6f} Ha")
+    print(f"E_0^(eta+1) = {ENp1:.6f} Ha")
+    print(f"1e resonans = {E_res_eV:.3f} eV\n")
 
-    T_vals = []
-    E_vals = []
+    resultater = []
 
-    for p in p_vals:
-        try:
-            S, E_tot = SMobj.S_matrix(
-                num_leads=2,
-                site_energy=site_energy,
-                beta=beta,
-                p_in=p
-            )
-            T_vals.append(float(abs(S[0, 1])**2))
-            E_vals.append(float(E_tot - E0))
-        except Exception:
-            T_vals.append(float("nan"))
-            E_vals.append(float("nan"))
+    for V in V_vals:
+        print(f"V = {V:.2f}...")
+        E_vals, T_vals = beregn_et_punkt(
+            SMobj, V, site_energy, beta, p_vals, num_leads
+        )
+        resultater.append({
+            "mol_navn"   : mol_navn,
+            "basis_set"  : basis_set,
+            "cas"        : cas,
+            "B"          : B_vec.tolist(),
+            "V"          : float(V),
+            "beta"       : beta,
+            "site_energy": site_energy,
+            "E_0_N"      : float(E0),
+            "eigval_Np1" : [float(e) for e in SMobj.eigval_Np1],
+            "E_res_eV"   : float(E_res_eV),
+            "E_vals"     : E_vals.tolist(),   # eV
+            "T_vals"     : T_vals.tolist(),
+        })
 
-    return {
-        "B"         : B_vec.tolist(),
-        "E_0_N"     : float(E0),
-        "eigval_Np1": [float(e) for e in ENp1],
-        "p_vals"    : p_vals.tolist(),
-        "E_vals"    : E_vals,
-        "T_vals"    : T_vals,
-    }
+        with open(gem_fil, "wb") as f:
+            pickle.dump(resultater, f)
+
+    print(f"\nFaerdig. Gemt: '{gem_fil}'")
+    return resultater
 
 
 # =======================================================================
-# Hoved: sweep over B-felt
+# Byg SMobj én gang og sweep over B-felt
 # =======================================================================
 
-def beregn_molekyle(
+def beregn_B_sweep(
     mol_navn,
     B_x_vals, B_y_vals, B_z_vals,
-    V=1.0, site_energy=1.0, beta=-1.0,
-    N_p=200, gem_fil=None
+    V            = 1.0,
+    site_energy  = 1.0,
+    beta         = -1.0,
+    N_p          = 300,
+    num_leads    = 2,
+    gem_fil      = None,
 ):
+    """
+    Sweeper over B-felt. Bygger WF for hvert B-punkt.
+    """
     if mol_navn not in MOLECULES:
-        raise ValueError(
-            f"'{mol_navn}' ikke fundet. "
-            f"Valgmuligheder: {list(MOLECULES.keys())}"
-        )
+        raise ValueError(f"'{mol_navn}' ikke fundet.")
 
     mol       = MOLECULES[mol_navn]
     geometry  = mol["geometry"]
@@ -163,15 +229,13 @@ def beregn_molekyle(
     cas       = mol["cas"]
 
     if gem_fil is None:
-        gem_fil = f"{mol_navn}_resultater.pkl"
+        gem_fil = f"{mol_navn}_B_sweep.pkl"
 
-    p_vals = np.linspace(0.05, np.pi - 0.05, N_p)
+    p_vals = np.linspace(0.01, np.pi - 0.01, N_p)
 
     print(f"\n{'='*60}")
     print(f"Molekyle : {mol_navn}  ({mol['beskr']})")
-    print(f"Basis    : {basis_set}, CAS: {cas}")
     print(f"V={V}, beta={beta}, site_energy={site_energy}")
-    print(f"Gem til  : {gem_fil}")
     print(f"{'='*60}\n")
 
     resultater = []
@@ -186,17 +250,44 @@ def beregn_molekyle(
                 print(f"[{tael}/{total}] B = {B_vec}")
 
                 try:
-                    res = beregn_et_punkt(
-                        geometry, basis_set, cas,
-                        B_vec, V, site_energy, beta, p_vals
+                    mo, h_kin, h_nuc_ao, g_eri, \
+                        t_LB, t_BB, h_nuc, pyscf_mol = \
+                        integral_provider(geometry, basis_set, B_vec)
+
+                    WF = WaveFunctionUCC(
+                        cas=cas,
+                        mo_coeffs=mo,
+                        integral_generator=pyscf_mol,
+                        excitations="sd"
                     )
-                    res["mol_navn"]    = mol_navn
-                    res["basis_set"]   = basis_set
-                    res["cas"]         = cas
-                    res["V"]           = V
-                    res["beta"]        = beta
-                    res["site_energy"] = site_energy
-                    resultater.append(res)
+                    WF._h_mo = one_electron_integral_transform(
+                        mo, h_kin + h_nuc_ao + t_BB + t_LB
+                    )
+
+                    SMobj = S_matrix_1e(wf=WF, h_nuc=h_nuc)
+
+                    E0    = SMobj.eigval_N[0]
+                    ENp1  = SMobj.eigval_Np1[0]
+                    E_res = (ENp1 - E0 - site_energy) * Ha_to_eV
+
+                    print(f"  1e resonans = {E_res:.3f} eV")
+
+                    E_vals, T_vals = beregn_et_punkt(
+                        SMobj, V, site_energy, beta, p_vals, num_leads
+                    )
+
+                    resultater.append({
+                        "mol_navn"   : mol_navn,
+                        "B"          : B_vec.tolist(),
+                        "V"          : float(V),
+                        "beta"       : beta,
+                        "site_energy": site_energy,
+                        "E_0_N"      : float(E0),
+                        "eigval_Np1" : [float(e) for e in SMobj.eigval_Np1],
+                        "E_res_eV"   : float(E_res),
+                        "E_vals"     : E_vals.tolist(),
+                        "T_vals"     : T_vals.tolist(),
+                    })
 
                 except Exception as e:
                     print(f"  FEJL: {e}")
@@ -206,12 +297,11 @@ def beregn_molekyle(
                         "fejl"    : str(e),
                     })
 
-                # Gem løbende efter hvert punkt
                 with open(gem_fil, "wb") as f:
                     pickle.dump(resultater, f)
                 print(f"  Gemt ({len(resultater)} punkter)")
 
-    print(f"\nFaerdig. Resultat: '{gem_fil}'")
+    print(f"\nFaerdig. Gemt: '{gem_fil}'")
     return resultater
 
 
@@ -226,33 +316,44 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mol", default="H2",
-        help=f"Molekyle ({list(MOLECULES.keys())})"
+        help=f"Molekyle: {list(MOLECULES.keys())}"
     )
-    parser.add_argument("--V",           type=float, default=1.0)
+    parser.add_argument(
+        "--V_vals", nargs="+", type=float, default=[1.0],
+        help="V-vaerdier fx --V_vals 2.0 2.1 2.2 2.3"
+    )
     parser.add_argument("--beta",        type=float, default=-1.0)
     parser.add_argument("--site_energy", type=float, default=1.0)
-    parser.add_argument("--N_p",         type=int,   default=200)
+    parser.add_argument("--N_p",         type=int,   default=500)
     parser.add_argument("--Bmax",        type=float, default=0.0)
     parser.add_argument("--Bstep",       type=float, default=0.5)
     parser.add_argument("--gem",         default=None)
     args = parser.parse_args()
 
     if args.Bmax > 0:
+        # B-felt sweep
         B_x = np.arange(0, args.Bmax + args.Bstep/2, args.Bstep)
         B_y = np.arange(0, args.Bmax + args.Bstep/2, args.Bstep)
+        B_z = [0.0]
+        beregn_B_sweep(
+            mol_navn    = args.mol,
+            B_x_vals    = B_x,
+            B_y_vals    = B_y,
+            B_z_vals    = B_z,
+            V           = args.V_vals[0],
+            beta        = args.beta,
+            site_energy = args.site_energy,
+            N_p         = args.N_p,
+            gem_fil     = args.gem,
+        )
     else:
-        B_x = [0.0]
-        B_y = [0.0]
-    B_z = [0.0]
-
-    beregn_molekyle(
-        mol_navn    = args.mol,
-        B_x_vals    = B_x,
-        B_y_vals    = B_y,
-        B_z_vals    = B_z,
-        V           = args.V,
-        beta        = args.beta,
-        site_energy = args.site_energy,
-        N_p         = args.N_p,
-        gem_fil     = args.gem,
-    )
+        # V-sweep ved B=0
+        beregn_V_sweep(
+            mol_navn    = args.mol,
+            V_vals      = args.V_vals,
+            B_vec       = np.array([0., 0., 0.]),
+            beta        = args.beta,
+            site_energy = args.site_energy,
+            N_p         = args.N_p,
+            gem_fil     = args.gem,
+        )
