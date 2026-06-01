@@ -6,6 +6,7 @@ Denne fil importeres af beregn.py og plot_resultater.py.
 """
 
 import numpy as np
+import pandas as pd
 import pyscf
 from pyscf import gto, scf
 
@@ -25,11 +26,46 @@ def annihilation(p: int, spin: str, dagger: bool) -> FermionicOperator:
     return a_op(p, spin, dagger=dagger)
 
 
+def compute_Vp(pyscf_mol, mo_coeffs, r_cut=0.1, grid_spacing=0.005):
+    """
+    V_p = sum_A integral_{|r - r_A| < r_cut} |chi_p(r)|^2 dr   (eq B.3)
+
+    pyscf_mol    : PySCF Mole object (coordinates in Bohr internally)
+    mo_coeffs    : MO coefficient matrix, shape (n_ao, n_mo)
+    r_cut        : integration radius in Bohr (default 0.1 a_0)
+    grid_spacing : Cartesian grid step in Bohr
+    """
+    atom_coords = pyscf_mol.atom_coords()   # (natm, 3) in Bohr
+    n_orbs = mo_coeffs.shape[1]
+    Vp = np.zeros(n_orbs)
+    dV = grid_spacing ** 3
+
+    steps = np.arange(-r_cut, r_cut + grid_spacing / 2, grid_spacing)
+    dx, dy, dz = np.meshgrid(steps, steps, steps, indexing='ij')
+    dx, dy, dz = dx.ravel(), dy.ravel(), dz.ravel()
+    mask = dx**2 + dy**2 + dz**2 <= r_cut**2
+
+    for atom_pos in atom_coords:
+        grid = np.column_stack([
+            atom_pos[0] + dx[mask],
+            atom_pos[1] + dy[mask],
+            atom_pos[2] + dz[mask],
+        ])
+        ao_vals  = pyscf_mol.eval_gto("GTOval", grid)   # (n_pts, n_ao)
+        mo_vals  = ao_vals @ mo_coeffs                   # (n_pts, n_mo)
+        Vp      += np.sum(np.abs(mo_vals)**2, axis=0) * dV
+
+    return Vp
+
+
 # =======================================================================
 # Integraler fra PySCF
 # =======================================================================
 
-def integral_provider(geometry: str, basis_set: str, B: np.ndarray):
+def integral_provider(
+        geometry: str, 
+        basis_set: str, 
+        B: np.ndarray):
     """
     Beregner alle molekylære integraler inkl. B-felt bidrag.
 
@@ -61,21 +97,40 @@ def integral_provider(geometry: str, basis_set: str, B: np.ndarray):
     rhf.kernel()
 
     mo    = rhf.mo_coeff
-    h_nuc = rhf.energy_nuc()
 
-    h_int1e_kin = mol.intor("int1e_kin")
-    h_int1e_nuc = mol.intor("int1e_nuc")
-    g_eri       = mol.intor("int2e")
+    print("# basis functions", len(mo))
 
-    t_LB = np.zeros((len(mo), len(mo)), dtype=np.complex128)
-    t_BB = np.zeros((len(mo), len(mo)), dtype=np.complex128)
+    h_nuc = rhf.energy_nuc() # nuclear repulsion
+
+    # AO basis integrals to build the Hamiltonian:
+    h_int1e_kin = mol.intor("int1e_kin") #kinetic
+    h_int1e_nuc = mol.intor('int1e_nuc' ) #nuclear attraction
+    g_eri       = mol.intor('int2e') #e-e repulsion. For real AOs there are a total of eight permutational symmetries present in the two-electron integrals.
+
+
+    # AO basis integrals due to B-field:
+    t_LB = np.zeros((len(mo),len(mo)),dtype=np.complex128)
+    t_BB = np.zeros((len(mo),len(mo)),dtype=np.complex128)
 
     B_x, B_y, B_z = B[0], B[1], B[2]
 
+
+    #AO basis:
     with mol.with_common_origin((0, 0, 0)):
+        '''
+        PySCF removes the imaginary number "i" in the L integrals. 
+        Recall L is purely imaginary and so are the integrals: L_x, L_y, L_z. 
+        It therefore makes the L matrix anti-symmetric instead of Hermitian, because 
+        t^*_pq = <phi_p|L|phi_q>^* = -<phi_q|L|phi_p> = -t_qp thus
+        t_pq = - t_qp^* which is not a Hermitian matrix. What is missing is "i" to make the integrals imaginary,
+        t_^*_pq = (i<phi_p|L|phi_q>)^* = t_qp thus t_pq = t^*_pq. 
+        '''
+        
         L_x, L_y, L_z = mol.intor("int1e_cg_irxp", comp=3)
-        r_xx, r_xy, r_xz, _, r_yy, r_yz, _, _, r_zz = mol.intor("int1e_rr")
+        r_xx,r_xy,r_xz,r_yx,r_yy,r_yz,r_zx,r_zy,r_zz = mol.intor("int1e_rr")
         r_dot_r = mol.intor("int1e_r2")
+    
+        #print(np.allclose(r_dot_r,mo.T.conj()@mol.intor("int1e_r2")@mo))
 
     for i in range(len(t_LB)):
         for j in range(len(t_LB)):
@@ -113,8 +168,14 @@ class S_matrix_1e:
                                    beta=-1.0, p_in=1.0)
     """
 
-    def __init__(self, wf, h_nuc):
+    def __init__(self, wf, h_nuc, pyscf_mol=None, mo_coeffs=None):
         self.wf = wf
+
+        if pyscf_mol is not None and mo_coeffs is not None:
+            self.Vp = compute_Vp(pyscf_mol, mo_coeffs)
+            print(f"Orbital coupling Vp: {self.Vp}")
+        else:
+            self.Vp = None
 
         # --- Byg determinantrum for eta og eta+1 ---
         ci_N = get_indexing(
@@ -208,6 +269,12 @@ class S_matrix_1e:
         for en in self.eigval_Np1:
             if abs(np.imag(en)) > 1e-6:
                 raise ValueError(f"Imaginaer energi i eta+1: {en}")
+
+        table_N = pd.DataFrame({"States (N)": np.arange(len(self.eigval_N)), "[Ha]": np.real(self.eigval_N)})
+        table_Np1 = pd.DataFrame({"States (Np1)": np.arange(len(self.eigval_Np1)), "[Ha]": np.real(self.eigval_Np1)})
+        #print(table_N)
+        #print(table_Np1)
+
 
     # -------------------------------------------------------------------
     # Property: V (koblingsstyrke)
@@ -321,6 +388,7 @@ class S_matrix_1e:
         site_energy: float,
         beta:        float,
         p_in:        float,
+        V_leads:     list = None,
     ):
         """
         Beregner enkelt-partikel S-matrix.
@@ -331,12 +399,18 @@ class S_matrix_1e:
         site_energy : on-site energi i lead (alpha)
         beta        : hop-amplitude i lead
         p_in        : indkommende impuls
+        V_leads     : koblingsstyrke per lead (liste af længde num_leads).
+                      Hvis None bruges self.V for alle leads.
+                      For asymmetrisk kobling (SI C.2): V_leads[0] = sqrt(2)*V_R,
+                      V_leads[1:] = V_R.
 
         Returnerer
         ----------
         S     : S-matrix (num_leads x num_leads)
         E_tot : total energi = site_energy + 2*beta*cos(p) + E_0^(eta)
         """
+        if V_leads is None:
+            V_leads = [self.V] * num_leads
 
         num_orbs = (
             self.wf.num_inactive_orbs
@@ -355,6 +429,7 @@ class S_matrix_1e:
             B_element = 0.0 + 0j
             for spin in spins:
                 for p in range(num_orbs):
+                    vp = self.Vp[p] if self.Vp is not None else 1.0
                     apd = annihilation(p, spin, True).get_folded_operator(
                         self.wf.num_inactive_orbs,
                         self.wf.num_active_orbs,
@@ -366,13 +441,13 @@ class S_matrix_1e:
                         det2idx=self.det2idx_unified,
                         unsafe_mode=True
                     )
-                    B_element += (
+                    B_element += vp * (
                         self.eigvec_Np1[:, g]
                         @ apd_mat
                         @ self.eigvec_N[:, 0]
                     )
             for n in range(num_leads):
-                B_mat[g, n] = B_element
+                B_mat[g, n] = V_leads[n] * B_element
 
         # --- D^{-1} ---
         D_inv = np.diag([
@@ -385,9 +460,9 @@ class S_matrix_1e:
         ph_m = np.cos(p_in) - 1j * np.sin(p_in)
 
         Q1 = (beta * np.eye(num_leads)
-              - self.V**2 * ph_p * B_mat.conj().T @ D_inv @ B_mat)
+              - ph_p * B_mat.conj().T @ D_inv @ B_mat)
         Q2 = (beta * np.eye(num_leads)
-              - self.V**2 * ph_m * B_mat.conj().T @ D_inv @ B_mat)
+              - ph_m * B_mat.conj().T @ D_inv @ B_mat)
 
         S = -np.linalg.inv(Q1) @ Q2
 

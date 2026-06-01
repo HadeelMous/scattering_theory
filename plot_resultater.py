@@ -108,7 +108,9 @@ def plot_artikel_stil(
     all_E = np.concatenate([r["E_vals"] for r in data])
     ax_bund.set_xlim(float(np.nanmin(all_E)),
                      float(np.nanmax(all_E)))
-    ax_bund.set_xlabel('Incoming Energy [eV]', fontsize=12)
+    all_E_min = float(np.nanmin(all_E))
+    xlabel = r'$E_\mathrm{in} = p^2/2m$ [eV]' if all_E_min >= -0.1 else 'Incoming Energy [eV]'
+    ax_bund.set_xlabel(xlabel, fontsize=12)
     ax_bund.set_ylabel('Transmission Magnitude', fontsize=12)
     ax_bund.tick_params(labelsize=11)
     ax_bund.legend(loc='upper right', fontsize=10, framealpha=0.9)
